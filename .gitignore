@@ -1,0 +1,29 @@
+# Node.js 依赖
+node_modules/
+
+# Wrangler 配置
+.env
+.env.*
+!.env.example
+
+# 日志文件
+logs
+*.log
+
+# 编辑器相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS 文件
+.DS_Store
+
+# 构建输出
+dist/
+build/
+
+# 临时文件
+.tmp/
+.cache/

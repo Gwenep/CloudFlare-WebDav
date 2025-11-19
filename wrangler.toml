@@ -1,0 +1,28 @@
+name = "cloudflare-webdav"
+main = "index.js"
+compatibility_date = "2023-09-01"
+
+[[kv_namespaces]]
+binding = "WEBDAV_STORAGE"
+# 将下面的 id 替换为你创建的 KV 命名空间 ID
+id = "your-kv-namespace-id"
+env = "production"
+
+# 可选：开发环境配置
+[env.dev]
+[[kv_namespaces]]
+binding = "WEBDAV_STORAGE"
+id = "your-dev-kv-namespace-id"
+
+# 可选：定义环境变量
+[vars]
+# 可以在这里定义全局变量
+MAX_UPLOAD_SIZE = 10000000  # 10MB
+
+# 可选：自定义路由
+# routes = [
+#   {
+#     pattern = "example.com/dav*",
+#     zone_name = "example.com"
+#   }
+# ]
