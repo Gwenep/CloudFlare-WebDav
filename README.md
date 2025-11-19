@@ -1,6 +1,6 @@
 # Cloudflare WebDAV Server
 
-基于 Cloudflare Workers 和 KV 存储的 WebDAV 服务器实现，提供轻量级的 WebDAV 服务，支持跨平台访问文件。
+基于 Cloudflare Workers 和 KV 存储的 WebDAV 服务器实现，提供轻量级的 WebDAV 服务，支持跨平台访问文件，无需绑卡开通R2存储。
 
 ## 功能特性
 
@@ -17,8 +17,6 @@
 ## 部署要求
 
 - Cloudflare 账号
-- Cloudflare Workers 订阅
-- Cloudflare KV 命名空间
 
 ## 快速开始
 
@@ -49,7 +47,7 @@ wrangler kv:namespace create WEBDAV_STORAGE
 
 ### 5. 设置认证信息
 
-在部署前，你需要修改代码中的认证逻辑，设置用户名和密码。
+在部署前，你需要在环境变量中，设置WEBDAV_USERNAME 和 WEBDAV_PASSWORD 用户名和密码。
 
 ### 6. 部署项目
 
@@ -84,7 +82,7 @@ wrangler publish
 
 ## 注意事项
 
-1. **文件大小限制**：受 Cloudflare Workers 限制，单个文件大小建议不超过 10MB
+1. **文件大小限制**：受 Cloudflare KV限制，单个文件大小建议不超过 10MB
 2. **KV 存储空间**：注意监控你的 KV 存储空间使用情况
 3. **认证安全**：确保设置强密码，考虑使用 HTTPS 连接
 4. **性能优化**：对于大量文件操作，建议批量处理以减少 KV 请求次数
@@ -93,16 +91,13 @@ wrangler publish
 ## 常见问题
 
 ### Q: 连接时提示认证失败
-A: 检查用户名和密码是否正确，确保认证逻辑正确配置
+A: 检查用户名和密码是否正确，确保在代码中正确配置了 `WEBDAV_USERNAME` 和 `WEBDAV_PASSWORD` 变量。
 
-### Q: Windows 下无法看到文件
+### Q: 目录下无法看到文件
 A: 确保 KV 命名空间正确配置，检查目录结构是否正确
 
 ### Q: 文件上传失败
 A: 检查文件大小是否超过限制，确保 KV 存储空间充足
-
-### Q: 手机文件管理器看不到内容
-A: 检查 PROPFIND 请求是否正确响应，确认深度头设置是否为 1
 
 ## 许可证
 
