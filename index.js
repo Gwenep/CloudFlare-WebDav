@@ -19,13 +19,50 @@ const RATE_LIMIT_WINDOW = 60 * 1000; // 1分钟窗口
 const MAX_REQUESTS_PER_WINDOW = 60; // 每分钟最多60个请求
 const MAX_UPLOAD_SIZE = 10 * 1024 * 1024; // 最大上传大小10MB
 
-// 管理界面 HTML 模板已删除（不再需要管理功能）
 
-
-
-// 请求速率限制实现（已禁用KV存储记录，避免生成rate_limit前缀的键）
+// 请求速率限制实现
 async function applyRateLimit(request, env) {
   try {
+    // 使用内存缓存而不是KV存储来减少KV读取
+    const cache = applyRateLimit.cache || (applyRateLimit.cache = new Map());
+    const now = Date.now();
+    
+    // 获取客户端IP
+    const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+    
+    // 清理过期的记录
+    const cutoff = now - RATE_LIMIT_WINDOW;
+    for (const [ip, data] of cache.entries()) {
+      if (data.timestamp < cutoff) {
+        cache.delete(ip);
+      }
+    }
+    
+    // 检查并更新请求计数
+    if (cache.has(clientIP)) {
+      const data = cache.get(clientIP);
+      
+      // 检查是否超出限制
+      if (data.count >= MAX_REQUESTS_PER_WINDOW) {
+        return new Response('请求过于频繁，请稍后再试', {
+          status: 429,
+          headers: {
+            'Retry-After': Math.ceil((data.timestamp + RATE_LIMIT_WINDOW - now) / 1000).toString(),
+            'Content-Type': 'text/plain; charset=utf-8'
+          }
+        });
+      }
+      
+      // 更新计数
+      data.count++;
+    } else {
+      // 新的客户端记录
+      cache.set(clientIP, {
+        timestamp: now,
+        count: 1
+      });
+    }
+    
     return null;
   } catch (error) {
     console.error('速率限制检查失败:', error);
@@ -107,7 +144,7 @@ export default {
             case 'DELETE':
               return await handleDelete(env, davPath);
             case 'MKCOL':
-      return await handleMkcol(env, davPath);
+              return await handleMkcol(env, davPath);
     // 添加更多WebDAV方法支持
     case 'COPY':
     case 'MOVE':
@@ -133,7 +170,9 @@ export default {
           'DAV': '1, 2, 3',
           'MS-Author-Via': 'DAV',
           'X-Content-Type-Options': 'nosniff',
-          'Content-Length': '0'
+          'Content-Length': '0',
+          'Access-Control-Allow-Origin': '*',
+          'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
         }
       });
           }
@@ -182,8 +221,11 @@ async function authenticateWebDAV(request, env) {
           status: 401,
           headers: {
             'WWW-Authenticate': 'Basic realm="WebDAV Server"',
-            'DAV': '1, 2',
-            'Content-Type': 'text/plain; charset=utf-8'
+            'DAV': '1, 2, 3',
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Access-Control-Allow-Origin': '*',
+            'MS-Author-Via': 'DAV',
+            'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
           }
         })
       };
@@ -351,8 +393,13 @@ async function verifyWebDAVCredentials(env, username, password) {
     const envUsername = env.WEBDAV_USERNAME || 'default';
     const envPassword = env.WEBDAV_PASSWORD || 'default';
     
-    // 简单的字符串匹配验证
-    return username === envUsername && password === envPassword;
+    // 简单的字符串匹配验证，但添加更健壮的错误处理
+    try {
+      return username === envUsername && password === envPassword;
+    } catch (error) {
+      console.error('凭据比较错误:', error);
+      return false;
+    }
   } catch (error) {
     console.error('验证 WebDAV 凭证时出错:', error);
     return false;
@@ -425,10 +472,17 @@ function handleOptions() {
       'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
       'Accept-Ranges': 'bytes',
       'Content-Length': '0',
-      'MS-Author-Via': 'DAV'
+      'MS-Author-Via': 'DAV',
+      'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type, Depth, Overwrite, Destination, X-Requested-With'
     }
   });
 }
+
+// 防止无限递归的最大深度限制
+const MAX_PROPFIND_DEPTH = 2;
 
 // 处理 PROPFIND 请求
 async function handlePropfind(request, env, path) {
@@ -436,17 +490,31 @@ async function handlePropfind(request, env, path) {
     // 规范化路径
     const normalizedPath = normalizePath(path);
     
-    // 获取深度头，为手机文件管理器提供更好的兼容性
+    // 获取深度头，为安卓文件管理器提供更好的兼容性
     const depthHeader = request.headers.get('Depth') || '1'; // 默认为1以显示目录内容
-    const depth = depthHeader === 'infinity' ? -1 : parseInt(depthHeader) || 0;
+    // 安全处理：限制最大深度，防止无限递归
+    let depth = depthHeader === 'infinity' ? MAX_PROPFIND_DEPTH : parseInt(depthHeader) || 1; // 安卓客户端通常期望至少为1
+    // 确保深度不超过最大限制
+    depth = Math.min(depth, MAX_PROPFIND_DEPTH);
     
     // 确保根目录存在
     await ensureRootDirectory(env);
     
     // 检查资源是否存在
-    const resourceInfo = await getResourceInfo(env, normalizedPath);
+    let resourceInfo = await getResourceInfo(env, normalizedPath);
+    
+    // 如果资源不存在但请求的是目录，尝试创建或模拟响应
     if (!resourceInfo) {
-      return new Response('资源不存在', { status: 404 });
+      // 如果请求的是根目录或类似目录的路径，返回空目录响应而不是404
+      if (normalizedPath === '/' || !normalizedPath.includes('.')) {
+        resourceInfo = {
+          type: 'directory',
+          modifiedAt: new Date().toISOString(),
+          size: 0
+        };
+      } else {
+        return new Response('资源不存在', { status: 404 });
+      }
     }
     
     // 构建 XML 响应，使用完整的DAV命名空间
@@ -461,28 +529,44 @@ async function handlePropfind(request, env, path) {
     );
     
     // 如果是深度遍历且是目录，列出子资源
-    if ((depth > 0 || depth === -1) && resourceInfo.type === 'directory') {
-      const children = await listDirectoryChildren(env, normalizedPath);
+    // 安卓客户端通常需要正确的目录内容列表
+    if (depth > 0 && resourceInfo.type === 'directory') {
+      let children = [];
+      try {
+        children = await listDirectoryChildren(env, normalizedPath);
+      } catch (error) {
+        console.error('列出目录子资源失败:', error);
+        // 即使失败也继续，至少返回当前目录信息
+      }
       
-      for (const child of children) {
-        const childPath = normalizedPath === '/' ? `/${child.name}` : `${normalizedPath}/${child.name}`;
-        xmlBody += createResourceResponse(
-          childPath, 
-          child.type === 'directory', 
-          new Date(child.modifiedAt),
-          child
-        );
+      // 确保子资源列表不为空时才处理
+      if (children && children.length > 0) {
+        for (const child of children) {
+          const childPath = normalizedPath === '/' ? `/${child.name}` : `${normalizedPath}/${child.name}`;
+          xmlBody += createResourceResponse(
+            childPath, 
+            child.type === 'directory', 
+            new Date(child.modifiedAt),
+            child
+          );
+        }
       }
     }
     
     xmlBody += '</D:multistatus>';
     
+    // 确保响应头正确设置，特别关注安卓兼容性
     return new Response(xmlBody, {
       headers: {
-        'Content-Type': 'application/xml',
+        'Content-Type': 'application/xml; charset=utf-8',
         'DAV': '1, 2, 3',
         'MS-Author-Via': 'DAV',
-        'Content-Length': xmlBody.length.toString()
+        'Content-Length': xmlBody.length.toString(),
+        'Access-Control-Allow-Origin': '*',
+        'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+        'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+        'Accept-Ranges': 'bytes',
+        'Last-Modified': new Date(resourceInfo.modifiedAt).toUTCString()
       }
     });
   } catch (error) {
@@ -493,8 +577,9 @@ async function handlePropfind(request, env, path) {
 
 // 创建资源响应 XML
 function createResourceResponse(path, isDirectory, lastModified, resourceInfo = {}) {
-  // 确保路径格式正确，添加绝对路径标记以兼容各种客户端
-  const hrefPath = path.startsWith('/') ? path : `/${path}`;
+  // 确保路径格式正确，为安卓客户端提供完整路径（包含/dav前缀）
+  const basePath = path.startsWith('/') ? path : `/${path}`;
+  const hrefPath = `/dav${basePath}`.replace(/\/\//g, '/'); // 确保路径正确，避免双斜杠
   
   const resourceType = isDirectory ? '<D:resourcetype><D:collection/></D:resourcetype>' : '<D:resourcetype/>';
   const formattedDate = lastModified.toUTCString();
@@ -555,17 +640,17 @@ function createResourceResponse(path, isDirectory, lastModified, resourceInfo = 
           ${resourceType}
           <D:getlastmodified>${formattedDate}</D:getlastmodified>
           <D:displayname>${displayName}</D:displayname>
-          ${size !== undefined ? `<D:getcontentlength>${size}</D:getcontentlength>` : ''}
+          ${size !== undefined ? `<D:getcontentlength>${size}</D:getcontentlength>` : '<D:getcontentlength>0</D:getcontentlength>'}
           <D:creationdate>${resourceInfo.createdAt ? new Date(resourceInfo.createdAt).toUTCString() : formattedDate}</D:creationdate>
           <D:getetag>${etag}</D:getetag>
           ${!isDirectory ? `<D:getcontenttype>${contentType}</D:getcontenttype>` : ''}
-          <!-- Windows和手机文件管理器所需的额外属性 -->
+          <!-- 安卓和Windows文件管理器所需的额外属性 -->
           <D:iscollection>${isDirectory ? '1' : '0'}</D:iscollection>
           <!-- 标准WebDAV属性 -->
-          <D:supportedlock></D:supportedlock>
-          <D:lockdiscovery></D:lockdiscovery>
-          <D:quota-available-bytes></D:quota-available-bytes>
-          <D:quota-used-bytes></D:quota-used-bytes>
+          <D:supportedlock/>
+          <D:lockdiscovery/>
+          <D:quota-available-bytes/>
+          <D:quota-used-bytes/>
         </D:prop>
         <D:status>HTTP/1.1 200 OK</D:status>
       </D:propstat>
@@ -738,9 +823,9 @@ async function generateDirectoryListing(env, path, resourceInfo) {
   try {
     const children = await listDirectoryChildren(env, path);
     
-    // 过滤掉任何可能的rate_limit记录
+   // 过滤掉任何空名称文件和目录标记
     const filteredChildren = children.filter(child => 
-      !child.name.startsWith('rate_limit:')
+      child.name.trim() !== '' && child.name !== '_dir'
     );
     
     let html = `<!DOCTYPE html>
@@ -841,13 +926,35 @@ async function handlePut(request, env, path) {
     // 确保父目录存在
     const parentPath = getParentPath(normalizedPath);
     if (parentPath) {
-      await ensureDirectoryExists(env, parentPath);
+      try {
+        await ensureDirectoryExists(env, parentPath);
+      } catch (error) {
+        if (error.message && error.message.includes('路径已被文件占用')) {
+          return new Response('父目录路径被文件占用', { 
+            status: 409,
+            headers: {
+              'Access-Control-Allow-Origin': '*',
+              'DAV': '1, 2, 3',
+              'MS-Author-Via': 'DAV',
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          });
+        }
+        throw error;
+      }
     }
     
     // 检查是否与现有目录冲突
     const existingInfo = await getResourceInfo(env, normalizedPath);
     if (existingInfo && existingInfo.type === 'directory') {
-      return new Response('不能覆盖目录', { status: 409 });
+      return new Response('不能覆盖目录', { 
+        status: 409,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
     }
     
     // 保存文件内容
@@ -865,10 +972,27 @@ async function handlePut(request, env, path) {
     // 更新父目录修改时间
     await updateDirectoryTimestamp(env, parentPath);
     
-    return new Response(null, { status: 201 });
+    // 为安卓客户端返回204状态码，有些客户端不喜欢201
+    return new Response(null, { 
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV',
+        'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
+      }
+    });
   } catch (error) {
-    console.error('PUT 处理错误:', error);
-    return new Response('上传文件时出错', { status: 500 });
+      console.error('PUT 处理错误:', error);
+      return new Response('上传文件时出错', { 
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV',
+          'Content-Type': 'text/plain; charset=utf-8'
+        }
+      });
   }
 }
 
@@ -927,16 +1051,48 @@ async function handleMkcol(env, path) {
     
     // 检查路径是否已存在
     const existingInfo = await getResourceInfo(env, normalizedPath);
-    if (existingInfo) {
-      return new Response('资源已存在', { status: 405 });
+    if (existingInfo && existingInfo.type === 'directory') {
+      return new Response('目录已存在', { 
+        status: 405,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
     }
     
     // 确保父目录存在
     const parentPath = getParentPath(normalizedPath);
     if (parentPath) {
-      const parentInfo = await getResourceInfo(env, parentPath);
-      if (!parentInfo || parentInfo.type !== 'directory') {
-        return new Response('父目录不存在', { status: 409 });
+      try {
+        // 使用ensureDirectoryExists来确保父目录存在，这样可以捕获路径被文件占用的情况
+        await ensureDirectoryExists(env, parentPath);
+      } catch (error) {
+        if (error.message && error.message.includes('路径已被文件占用')) {
+          return new Response('父目录路径被文件占用', { 
+            status: 409,
+            headers: {
+              'Access-Control-Allow-Origin': '*',
+              'DAV': '1, 2, 3',
+              'MS-Author-Via': 'DAV',
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          });
+        }
+        // 对于其他错误，使用更通用的检查
+        const parentInfo = await getResourceInfo(env, parentPath);
+        if (!parentInfo || parentInfo.type !== 'directory') {
+          return new Response('父目录不存在', { 
+            status: 409,
+            headers: {
+              'Access-Control-Allow-Origin': '*',
+              'DAV': '1, 2, 3',
+              'MS-Author-Via': 'DAV',
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          });
+        }
       }
     }
     
@@ -953,10 +1109,26 @@ async function handleMkcol(env, path) {
     // 更新父目录修改时间
     await updateDirectoryTimestamp(env, parentPath);
     
-    return new Response(null, { status: 201 });
+    return new Response(null, { 
+      status: 201,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV',
+        'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
+      }
+    });
   } catch (error) {
-    console.error('MKCOL 处理错误:', error);
-    return new Response('创建目录时出错', { status: 500 });
+      console.error('MKCOL 处理错误:', error);
+      return new Response('创建目录时出错', { 
+        status: 500,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV',
+          'Content-Type': 'text/plain; charset=utf-8'
+        }
+      });
   }
 }
 
@@ -971,10 +1143,9 @@ function normalizePath(path) {
   // 移除连续的斜杠
   normalized = normalized.replace(/\/+/g, '/');
   
-  // 对于Windows和SCP兼容性，保留末尾斜杠用于目录（某些客户端需要这个）
-  // 但在内部处理时保持一致性
-  const isDirectoryPath = path.endsWith('/') && normalized !== '/';
-  if (!isDirectoryPath && normalized !== '/' && normalized.endsWith('/')) {
+  // 统一格式：始终移除末尾斜杠，除非是根目录
+  // 这确保了路径处理的一致性，避免创建重复目录
+  if (normalized !== '/' && normalized.endsWith('/')) {
     normalized = normalized.slice(0, -1);
   }
   
@@ -1020,23 +1191,42 @@ function formatFileSize(bytes) {
 async function ensureDirectoryExists(env, path) {
   if (!path || path === '/') return;
   
-  // 简化目录存储，只使用统一的目录标记方式
-  const dirPath = `${path}_dir`;
-  const dirExists = await env.WEBDAV_STORAGE.get(dirPath) !== null;
+  // 规范化路径，确保无论是否有末尾斜杠都使用统一的路径格式
+  const normalizedPath = normalizePath(path);
   
-  if (!dirExists) {
-    // 递归创建父目录
-    const parentPath = getParentPath(path);
-    if (parentPath) {
-      await ensureDirectoryExists(env, parentPath);
+  // 简化目录存储，只使用统一的目录标记方式
+  const dirPath = `${normalizedPath}_dir`;
+  
+  try {
+    // 首先检查是否有同名文件存在
+    const fileExists = await env.WEBDAV_STORAGE.get(normalizedPath) !== null;
+    const metaExists = await env.WEBDAV_STORAGE.get(`${normalizedPath}_meta`) !== null;
+    
+    if (fileExists || metaExists) {
+      // 如果路径上已存在文件，抛出错误
+      throw new Error(`路径已被文件占用: ${normalizedPath}`);
     }
     
-    // 只创建一个目录标记
-    await env.WEBDAV_STORAGE.put(dirPath, JSON.stringify({
-      type: 'directory',
-      createdAt: new Date().toISOString(),
-      modifiedAt: new Date().toISOString()
-    }));
+    const dirExists = await env.WEBDAV_STORAGE.get(dirPath) !== null;
+    
+    if (!dirExists) {
+      // 递归创建父目录
+      const parentPath = getParentPath(normalizedPath);
+      if (parentPath) {
+        await ensureDirectoryExists(env, parentPath);
+      }
+      
+      // 只创建一个目录标记
+      await env.WEBDAV_STORAGE.put(dirPath, JSON.stringify({
+        type: 'directory',
+        createdAt: new Date().toISOString(),
+        modifiedAt: new Date().toISOString()
+      }));
+      console.log(`目录已创建: ${normalizedPath}`);
+    }
+  } catch (error) {
+    console.error(`创建目录失败: ${normalizedPath}`, error);
+    throw error; // 重新抛出错误，让调用者知道发生了问题
   }
 }
 
@@ -1146,8 +1336,8 @@ async function listDirectoryChildren(env, path) {
     
     // 首先处理目录标记
     for (const key of listResult.keys) {
-      // 跳过元数据、速率限制记录和非目录标记
-      if (key.name.endsWith('_meta') || key.name.startsWith('rate_limit:') || !key.name.endsWith('_dir')) continue;
+      // 跳过元数据和非目录标记
+      if (key.name.endsWith('_meta') || !key.name.endsWith('_dir')) continue;
       
       let dirName;
       if (normalizedPath === '/') {
@@ -1161,12 +1351,14 @@ async function listDirectoryChildren(env, path) {
       }
       
       // 确保目录名有效且未被处理过，并且不是完整路径
-      if (!dirName || processedChildren.has(dirName) || 
+      // 只在根目录且目录名为空时跳过（即对应_dir标记）
+      if ((normalizedPath === '/' && dirName.trim() === '') || 
+          processedChildren.has(dirName) || 
           (normalizedPath !== '/' && dirName.includes('/'))) continue;
       
       // 获取目录信息
       const dirInfo = await env.WEBDAV_STORAGE.get(key.name, 'json');
-      if (dirInfo || true) { // 如果没有dirInfo也认为是目录，确保能显示目录
+      if (dirInfo) { // 只在有有效目录信息时才添加目录
         processedChildren.add(dirName);
         children.push({
           name: dirName,
@@ -1180,9 +1372,8 @@ async function listDirectoryChildren(env, path) {
     
     // 然后处理文件
     for (const key of listResult.keys) {
-      // 跳过元数据、目录标记、速率限制记录和已经处理过的资源
-      if (key.name.endsWith('_meta') || key.name.endsWith('_dir') || 
-          key.name.startsWith('rate_limit:') || processedChildren.has(key.name)) continue;
+      // 跳过元数据、目录标记、已经处理过的资源
+      if (key.name.endsWith('_meta') || key.name.endsWith('_dir') || processedChildren.has(key.name)) continue;
       
       // 对于根目录，检查是否为顶级文件
       if (normalizedPath === '/') {
@@ -1191,8 +1382,8 @@ async function listDirectoryChildren(env, path) {
         const isDirectory = listResult.keys.some(k => k.name === potentialDirMark);
         
         if (!isDirectory) {
-          // 确保不是子目录中的文件路径
-          if (!key.name.includes('/')) {
+          // 确保不是子目录中的文件路径，且文件名不为空，且不是目录标记
+          if (!key.name.includes('/') && key.name.trim() !== '' && key.name !== '_dir') {
             processedChildren.add(key.name);
             
             // 获取文件元数据
