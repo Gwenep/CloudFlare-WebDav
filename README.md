@@ -47,7 +47,7 @@ wrangler kv:namespace create WEBDAV_STORAGE
 
 ### 5. 设置认证信息
 
-在部署前，你需要在环境变量中，设置WEBDAV_USERNAME 和 WEBDAV_PASSWORD 用户名和密码。
+编辑 `wrangler.toml` 文件，设置WEBDAV_USERNAME 和 WEBDAV_PASSWORD 用户名和密码。
 
 ### 6. 部署项目
 
