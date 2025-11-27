@@ -57,7 +57,7 @@ wrangler publish
 
 ## 客户端配置
 
-### Windows 文件资源管理器
+### Windows 文件资源管理器（谨慎！存在严重的kv读取问题，频繁进行kv读取）
 
 1. 打开文件资源管理器
 2. 右键点击"此电脑"，选择"映射网络驱动器"
@@ -69,14 +69,14 @@ wrangler publish
 
 1. 打开 Finder
 2. 点击"前往" > "连接服务器"
-3. 输入：`https://your-worker-name.your-username.workers.dev/dav`
+3. 输入：`https://your-worker-name.your-username.workers.dev`
 4. 点击"连接"，输入用户名和密码
 
 ### 手机文件管理器
 
 大多数支持 WebDAV 的手机文件管理器都可以连接：
 
-- 服务器地址：`https://your-worker-name.your-username.workers.dev/dav`
+- 服务器地址：`https://your-worker-name.your-username.workers.dev`
 - 用户名：你设置的用户名
 - 密码：你设置的密码
 

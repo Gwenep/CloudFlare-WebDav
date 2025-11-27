@@ -84,37 +84,21 @@ export default {
       const path = url.pathname;
       
       // 处理根路径
-      if (path === '/') {
-        return new Response('前面的区域请以后再来探索吧！', {
-          headers: {
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-            'X-Content-Type-Options': 'nosniff',
-            'X-Frame-Options': 'DENY',
-            'X-XSS-Protection': '1; mode=block',
-            'Referrer-Policy': 'strict-origin-when-cross-origin',
-            'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
-          }
-        });
-      }
+      // 不再拦截根路径请求，让WebDAV服务正常处理根路径
+      // WebDAV客户端需要能够访问根目录以列出文件和目录
       
-      // 处理 WebDAV 请求，支持/dav路径
+      // 处理 WebDAV 请求，直接运行在根路径
       try {
-        // 检查是否是/dav路径的请求
-        const isDavRequest = path.startsWith('/dav');
+        // 对所有请求进行身份验证
+        const authResult = await authenticateWebDAV(request, env);
+        if (!authResult.authenticated) {
+          return authResult.response;
+        }
         
-        if (isDavRequest) {
-          // 对于/dav路径的请求，进行身份验证
-          const authResult = await authenticateWebDAV(request, env);
-          if (!authResult.authenticated) {
-            return authResult.response;
-          }
-          
-          // 去除/dav前缀，获取实际路径
-          // 确保路径规范化，特别是处理根路径时
-          const davPath = path === '/dav' || path === '/dav/' ? '/' : path.replace('/dav', '');
-          
-          // 处理 WebDAV 方法
+        // 确保路径规范化，特别是处理根路径时
+        const davPath = path === '/' ? '/' : path;
+        
+        // 处理 WebDAV 方法
           switch (request.method) {
             case 'OPTIONS':
               return handleOptions();
@@ -188,15 +172,8 @@ export default {
         }
       });
           }
-        } else {
-          // 非/dav路径返回404
-          return new Response('Not Found', {
-            status: 404,
-            headers: {
-              'Content-Type': 'text/plain; charset=utf-8'
-            }
-          });
-        }
+        // 不再区分路径，所有请求都视为WebDAV请求
+        // 移除非/dav路径返回404的逻辑
       } catch (error) {
         console.error('处理WebDAV请求时发生错误:', error);
         // 不向客户端暴露详细错误信息
@@ -589,9 +566,9 @@ async function handlePropfind(request, env, path) {
 
 // 创建资源响应 XML
 function createResourceResponse(path, isDirectory, lastModified, resourceInfo = {}) {
-  // 确保路径格式正确，为安卓客户端提供完整路径（包含/dav前缀）
+  // 确保路径格式正确
   const basePath = path.startsWith('/') ? path : `/${path}`;
-  const hrefPath = `/dav${basePath}`.replace(/\/\//g, '/'); // 确保路径正确，避免双斜杠
+  const hrefPath = `${basePath}`.replace(/\/\//g, '/'); // 确保路径正确，避免双斜杠
   
   const resourceType = isDirectory ? '<D:resourcetype><D:collection/></D:resourcetype>' : '<D:resourcetype/>';
   const formattedDate = lastModified.toUTCString();
@@ -873,7 +850,7 @@ async function generateDirectoryListing(env, path, resourceInfo) {
     if (path !== '/') {
       const parentPath = getParentPath(path);
       // 使用简单直接的方式构建父目录链接，确保不会出现双斜杠
-      const parentLink = `/dav${parentPath}`.replace(/\/\//g, '/');
+      const parentLink = `${parentPath}`.replace(/\/\//g, '/');
       html += `
       <tr>
         <td><a href="${parentLink}" class="dir">..</a></td>
@@ -887,11 +864,11 @@ async function generateDirectoryListing(env, path, resourceInfo) {
     for (const child of filteredChildren) {
       // 更精确的路径构建，避免根目录下出现双斜杠
       let fullLink;
-      if (path === '/') {
-        fullLink = `/dav/${child.name}`;
-      } else {
-        fullLink = `/dav${path}/${child.name}`;
-      }
+        if (path === '/') {
+          fullLink = `/${child.name}`;
+        } else {
+          fullLink = `${path}/${child.name}`;
+        }
       // 最后再清理可能存在的双斜杠
       fullLink = fullLink.replace(/\/\//g, '/');
       const linkClass = child.type === 'directory' ? 'dir' : 'file';
@@ -993,7 +970,7 @@ async function handlePut(request, env, path) {
         'DAV': '1, 2, 3',
         'MS-Author-Via': 'DAV',
         'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
-        'Content-Location': `/dav${normalizedPath}`
+          'Content-Location': `${normalizedPath}`
       }
     });
   } catch (error) {
@@ -1076,10 +1053,8 @@ async function handleCopy(request, env, path) {
     const destinationUrl = new URL(destinationHeader);
     let destinationPath = destinationUrl.pathname;
     
-    // 移除/dav前缀
-    if (destinationPath.startsWith('/dav')) {
-      destinationPath = destinationPath.slice(4);
-    }
+    // 不再需要移除/dav前缀
+      // destinationPath已直接使用
     
     const normalizedDestPath = normalizePath(destinationPath);
     
@@ -1176,10 +1151,8 @@ async function handleMove(request, env, path) {
     const destinationUrl = new URL(destinationHeader);
     let destinationPath = destinationUrl.pathname;
     
-    // 移除/dav前缀
-    if (destinationPath.startsWith('/dav')) {
-      destinationPath = destinationPath.slice(4);
-    }
+    // 不再需要移除/dav前缀
+      // destinationPath已直接使用
     
     const normalizedDestPath = normalizePath(destinationPath);
     
@@ -1507,7 +1480,7 @@ async function ensureRootDirectory(env) {
   }
 }
 
-// 获取资源信息
+// 获取资源信息（优化版：减少KV读取次数）
 async function getResourceInfo(env, path) {
   try {
     // 确保路径不为空
@@ -1523,22 +1496,11 @@ async function getResourceInfo(env, path) {
       return dirInfo;
     }
     
-    // 检查是否是文件（尝试获取元数据）
+    // 检查是否是文件（只获取元数据，不单独检查文件内容）
     const metaPath = `${path}_meta`;
     const metaInfo = await env.WEBDAV_STORAGE.get(metaPath, 'json');
     if (metaInfo && metaInfo.type === 'file') {
       return metaInfo;
-    }
-    
-    // 检查文件内容是否存在
-    const contentExists = await env.WEBDAV_STORAGE.get(path) !== null;
-    if (contentExists) {
-      // 如果文件内容存在但元数据不存在，创建基本元数据
-      const basicInfo = {
-        type: 'file',
-        modifiedAt: new Date().toISOString()
-      };
-      return basicInfo;
     }
     
     return null;
@@ -1548,7 +1510,7 @@ async function getResourceInfo(env, path) {
   }
 }
 
-// 列出目录子资源
+// 列出目录子资源（优化版：批量获取减少KV读取次数）
 async function listDirectoryChildren(env, path) {
   try {
     // 确保路径不为空
@@ -1573,107 +1535,100 @@ async function listDirectoryChildren(env, path) {
       limit: 1000 // 设置合理的限制，避免一次性加载太多项
     });
     
-    // 首先处理目录标记
+    // 收集所有需要处理的目录信息
+    const directoriesToProcess = [];
     for (const key of listResult.keys) {
-      // 跳过元数据和非目录标记
       if (key.name.endsWith('_meta') || !key.name.endsWith('_dir')) continue;
       
       let dirName;
       if (normalizedPath === '/') {
-        // 根目录下的目录标记格式为：${dirname}_dir
-        dirName = key.name.slice(0, -4); // 移除_dir后缀
+        dirName = key.name.slice(0, -4);
       } else {
-        // 子目录下的目录标记格式为：${path}/${dirname}_dir
         const relativePath = key.name.substring(prefix.length);
         const lastUnderscoreIndex = relativePath.lastIndexOf('_');
         dirName = relativePath.substring(0, lastUnderscoreIndex);
       }
       
-      // 确保目录名有效且未被处理过，并且不是完整路径
-      // 只在根目录且目录名为空时跳过（即对应_dir标记）
       if ((normalizedPath === '/' && dirName.trim() === '') || 
           processedChildren.has(dirName) || 
           (normalizedPath !== '/' && dirName.includes('/'))) continue;
       
-      // 获取目录信息
-      const dirInfo = await env.WEBDAV_STORAGE.get(key.name, 'json');
-      if (dirInfo) { // 只在有有效目录信息时才添加目录
-        processedChildren.add(dirName);
+      directoriesToProcess.push({ dirName, keyName: key.name });
+    }
+    
+    // 批量获取目录信息
+    const dirPromises = directoriesToProcess.map(dir => 
+      env.WEBDAV_STORAGE.get(dir.keyName, 'json')
+    );
+    const dirResults = await Promise.all(dirPromises);
+    
+    // 添加目录到结果
+    directoriesToProcess.forEach((dir, index) => {
+      const dirInfo = dirResults[index];
+      if (dirInfo) {
+        processedChildren.add(dir.dirName);
         children.push({
-          name: dirName,
+          name: dir.dirName,
           type: 'directory',
           modifiedAt: dirInfo?.modifiedAt || new Date().toISOString(),
-          size: 0, // 为目录设置大小为0，而不是undefined
+          size: 0,
           contentType: 'httpd/unix-directory'
         });
       }
-    }
+    });
     
-    // 然后处理文件
+    // 收集所有需要处理的文件信息
+    const filesToProcess = [];
     for (const key of listResult.keys) {
-      // 跳过元数据、目录标记、已经处理过的资源
       if (key.name.endsWith('_meta') || key.name.endsWith('_dir') || processedChildren.has(key.name)) continue;
       
-      // 对于根目录，检查是否为顶级文件
+      let isFile = false;
+      let fileName = '';
+      let fileKeyName = '';
+      
       if (normalizedPath === '/') {
-        // 检查是否存在对应的目录标记
         const potentialDirMark = `${key.name}_dir`;
         const isDirectory = listResult.keys.some(k => k.name === potentialDirMark);
         
-        if (!isDirectory) {
-          // 确保不是子目录中的文件路径，且文件名不为空，且不是目录标记
-          if (!key.name.includes('/') && key.name.trim() !== '' && key.name !== '_dir') {
-            processedChildren.add(key.name);
-            
-            // 获取文件元数据
-            let metaData;
-            try {
-              metaData = await env.WEBDAV_STORAGE.get(`${key.name}_meta`, 'json');
-            } catch (e) {
-              metaData = null;
-            }
-            
-            // 只使用元数据中的大小信息，避免额外的KV访问
-            const fileSize = metaData?.size || 0;
-            
-            children.push({
-              name: key.name,
-              type: 'file',
-              modifiedAt: metaData?.modifiedAt || new Date().toISOString(),
-              size: fileSize,
-              contentType: metaData?.contentType
-            });
-          }
+        if (!isDirectory && !key.name.includes('/') && key.name.trim() !== '' && key.name !== '_dir') {
+          isFile = true;
+          fileName = key.name;
+          fileKeyName = key.name;
         }
       } else {
-        // 子目录下的文件处理
         const relativePath = key.name.substring(prefix.length);
-        
-        // 只处理直接子文件（不包含子目录内的文件）
         if (!relativePath.includes('/')) {
-          processedChildren.add(relativePath);
-          
-          // 获取文件元数据
-          let metaData;
-          try {
-            metaData = await env.WEBDAV_STORAGE.get(`${key.name}_meta`, 'json');
-          } catch (e) {
-            metaData = null;
-          }
-          
-          // 只使用元数据中的大小信息，避免额外的KV访问
-          const fileSize = metaData?.size || 0;
-          
-          children.push({
-            name: relativePath,
-            type: 'file',
-            modifiedAt: metaData?.modifiedAt || new Date().toISOString(),
-            size: fileSize,
-            contentType: metaData?.contentType
-          });
+          isFile = true;
+          fileName = relativePath;
+          fileKeyName = key.name;
         }
       }
+      
+      if (isFile && fileName) {
+        filesToProcess.push({ fileName, fileKeyName });
+      }
     }
+    
+    // 批量获取文件元数据
+    const metaPromises = filesToProcess.map(file => 
+      env.WEBDAV_STORAGE.get(`${file.fileKeyName}_meta`, 'json').catch(() => null)
+    );
+    const metaResults = await Promise.all(metaPromises);
+    
+    // 添加文件到结果
+    filesToProcess.forEach((file, index) => {
+      const metaData = metaResults[index];
+      const fileSize = metaData?.size || 0;
+      
+      processedChildren.add(file.fileName);
+      children.push({
+        name: file.fileName,
+        type: 'file',
+        modifiedAt: metaData?.modifiedAt || new Date().toISOString(),
+        size: fileSize,
+        contentType: metaData?.contentType
+      });
+    });
     
     // 按名称排序，目录在前，文件在后
     children.sort((a, b) => {
