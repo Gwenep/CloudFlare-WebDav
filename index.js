@@ -80,7 +80,35 @@ export default {
       if (rateLimited) {
         return rateLimited;
       }
-      const url = new URL(request.url);
+      
+      // 安全地解析URL
+      let url;
+      try {
+        // 直接使用 request.url 创建 URL 对象
+        url = new URL(request.url);
+      } catch (e) {
+        // 如果 URL 解析失败，可能是因为 request.url 只是路径部分（如 "/"）
+        // 从请求头获取必要信息构建完整 URL
+        const host = request.headers.get('Host') || 'localhost';
+        const protocol = request.headers.get('X-Forwarded-Proto') || 
+                        (request.url.startsWith('https://') ? 'https' : 'http');
+        
+        // 确保 request.url 是有效的路径
+        let requestPath = request.url;
+        if (!requestPath.startsWith('/')) {
+          requestPath = `/${requestPath}`;
+        }
+        
+        // 构建完整 URL
+        const fullUrl = `${protocol}://${host}${requestPath}`;
+        try {
+          url = new URL(fullUrl);
+        } catch (innerError) {
+          // 如果构建的 URL 仍然无效，使用默认值
+          console.warn('无法构建完整 URL，使用默认值:', fullUrl);
+          url = new URL(`${protocol}://${host}/`);
+        }
+      }
       const path = url.pathname;
       
       // 处理根路径
@@ -89,101 +117,153 @@ export default {
       
       // 处理 WebDAV 请求，直接运行在根路径
       try {
+        // 处理登出请求
+        if (path === '/logout') {
+          // 清除 session 和 cookie
+          const cookieHeader = request.headers.get('Cookie');
+          if (cookieHeader) {
+            const tokenMatch = cookieHeader.match(/webdav_auth=([^;]+)/);
+            if (tokenMatch && tokenMatch[1]) {
+              const token = tokenMatch[1];
+              const tokenKey = `session_${token}`;
+              // 删除KV中的session数据
+              try {
+                await env.WEBDAV_STORAGE.delete(tokenKey);
+              } catch (error) {
+                console.error('删除session失败:', error);
+              }
+            }
+          }
+          
+          // 清除cookie
+          const protocol = request.url.startsWith('https://') ? 'https://' : 'http://';
+          const host = request.headers.get('Host') || 'localhost';
+          const redirectUrl = `${protocol}${host}/`;
+          
+          const isHttps = request.url.startsWith('https://');
+          const secureFlag = isHttps ? 'Secure;' : '';
+          
+          return new Response(null, {
+            status: 302,
+            headers: {
+              'Location': redirectUrl,
+              'Set-Cookie': `webdav_auth=; Path=/; HttpOnly; ${secureFlag} SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          });
+        }
+        
         // 对所有请求进行身份验证
         const authResult = await authenticateWebDAV(request, env);
         if (!authResult.authenticated) {
           return authResult.response;
         }
         
+        // 添加CSRF令牌到响应的辅助函数
+        const addCsrfToken = (response) => {
+          const responseHeaders = new Headers(response.headers);
+          if (authResult.csrfToken) {
+            responseHeaders.set('X-CSRF-Token', authResult.csrfToken);
+          }
+          return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: responseHeaders
+          });
+        };
+        
         // 确保路径规范化，特别是处理根路径时
         const davPath = path === '/' ? '/' : path;
         
         // 处理 WebDAV 方法
-          switch (request.method) {
-            case 'OPTIONS':
-              return handleOptions();
-            case 'PROPFIND':
-              return await handlePropfind(request, env, davPath);
-            case 'GET':
-              return await handleGet(env, davPath, request);
-            case 'HEAD':
-              // 处理HEAD请求，与GET类似但不返回内容
-              const getResponse = await handleGet(env, davPath, request);
-              return new Response(null, {
-                headers: getResponse.headers,
-                status: getResponse.status
-              });
-            case 'PUT':
-              // 检查上传大小限制
-              const contentLength = request.headers.get('Content-Length');
-              if (contentLength && parseInt(contentLength) > MAX_UPLOAD_SIZE) {
-                return new Response('上传文件过大', {
-                  status: 413,
-                  headers: {
-                    'Content-Type': 'text/plain; charset=utf-8'
-                  }
-                });
+        switch (request.method) {
+          case 'OPTIONS':
+            return addCsrfToken(handleOptions());
+          case 'PROPFIND':
+            return addCsrfToken(await handlePropfind(request, env, davPath));
+          case 'GET':
+            return addCsrfToken(await handleGet(env, davPath, request));
+          case 'HEAD':
+            // 处理HEAD请求，与GET类似但不返回内容
+            const getResponse = await handleGet(env, davPath, request);
+            return addCsrfToken(new Response(null, {
+              headers: getResponse.headers,
+              status: getResponse.status
+            }));
+          case 'PUT':
+            // 检查上传大小限制
+            const contentLength = request.headers.get('Content-Length');
+            if (contentLength && parseInt(contentLength) > MAX_UPLOAD_SIZE) {
+              return addCsrfToken(new Response('上传文件过大', {
+                status: 413,
+                headers: {
+                  'Content-Type': 'text/plain; charset=utf-8'
+                }
+              }));
+            }
+            return addCsrfToken(await handlePut(request, env, davPath));
+          case 'DELETE':
+            return addCsrfToken(await handleDelete(env, davPath));
+          case 'MKCOL':
+            return addCsrfToken(await handleMkcol(env, davPath));
+          // 添加更多WebDAV方法支持
+          case 'COPY':
+            return addCsrfToken(await handleCopy(request, env, davPath));
+          case 'MOVE':
+            return addCsrfToken(await handleMove(request, env, davPath));
+          case 'PROPPATCH':
+            // PROPPATCH方法用于修改资源属性，基本实现以支持更多客户端
+            return addCsrfToken(new Response(null, { 
+              status: 204,
+              headers: {
+                'DAV': '1, 2, 3',
+                'MS-Author-Via': 'DAV',
+                'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH',
+                'X-Content-Type-Options': 'nosniff'
               }
-              return await handlePut(request, env, davPath);
-            case 'DELETE':
-              return await handleDelete(env, davPath);
-            case 'MKCOL':
-              return await handleMkcol(env, davPath);
-    // 添加更多WebDAV方法支持
-    case 'COPY':
-      return await handleCopy(request, env, davPath);
-    case 'MOVE':
-      return await handleMove(request, env, davPath);
-    case 'PROPPATCH':
-      // PROPPATCH方法用于修改资源属性，基本实现以支持更多客户端
-      return new Response(null, { 
-        status: 204,
-        headers: {
-          'DAV': '1, 2, 3',
-          'MS-Author-Via': 'DAV',
-          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH',
-          'X-Content-Type-Options': 'nosniff'
-        }
-      });
-    case 'LOCK':
-    case 'UNLOCK':
-      // 基本的LOCK/UNLOCK支持，返回200以支持更多客户端
-      return new Response(null, { 
-        status: 200,
-        headers: {
-          'DAV': '1, 2, 3',
-          'MS-Author-Via': 'DAV',
-          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
-          'X-Content-Type-Options': 'nosniff'
-        }
-      });
-    default:
-      // 为不支持的方法返回更友好的响应，确保移动文件管理器兼容性
-      return new Response('方法不支持', { 
-        status: 200,
-        headers: {
-          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
-          'DAV': '1, 2, 3',
-          'MS-Author-Via': 'DAV',
-          'X-Content-Type-Options': 'nosniff',
-          'Content-Length': '0',
-          'Access-Control-Allow-Origin': '*',
-          'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
-        }
-      });
+            }));
+          case 'LOCK':
+          case 'UNLOCK':
+            // 基本的LOCK/UNLOCK支持，返回200以支持更多客户端
+            return addCsrfToken(new Response(null, { 
+              status: 200,
+              headers: {
+                'DAV': '1, 2, 3',
+                'MS-Author-Via': 'DAV',
+                'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
+                'X-Content-Type-Options': 'nosniff'
+              }
+            }));
+          case 'POST':
+              // 处理POST请求（用于创建文件夹、上传文件等操作）
+              return addCsrfToken(await handlePost(request, env, davPath));
+            default:
+              // 为不支持的方法返回更友好的响应，确保移动文件管理器兼容性
+              return addCsrfToken(new Response('方法不支持', { 
+                status: 200,
+                headers: {
+                  'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+                  'DAV': '1, 2, 3',
+                  'MS-Author-Via': 'DAV',
+                  'X-Content-Type-Options': 'nosniff',
+                  'Content-Length': '0',
+                  'Access-Control-Allow-Origin': '*',
+                  'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
+                }
+              }));
           }
         // 不再区分路径，所有请求都视为WebDAV请求
         // 移除非/dav路径返回404的逻辑
       } catch (error) {
         console.error('处理WebDAV请求时发生错误:', error);
         // 不向客户端暴露详细错误信息
-        return new Response('服务器内部错误', {
+        return addCsrfToken(new Response('服务器内部错误', {
           status: 500,
           headers: {
             'Content-Type': 'text/plain; charset=utf-8',
             'X-Content-Type-Options': 'nosniff'
           }
-        });
+        }));
       }
     } catch (error) {
       console.error('请求处理错误:', error);
@@ -198,86 +278,378 @@ export default {
   }
 };
 
+// 不再使用session，直接使用认证方式处理请求
+
+// 渲染登录页面
+function renderLoginPage(errorMessage = '') {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文件管理登录</title>
+  <style>
+    /* 全局样式 */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    
+    /* 登录容器 */
+    .login-container {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+      padding: 40px;
+      width: 100%;
+      max-width: 420px;
+    }
+    
+    /* 标题 */
+    h1 {
+      color: #2d3748;
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 30px;
+      text-align: center;
+    }
+    
+    /* 表单组 */
+    .form-group {
+      margin-bottom: 24px;
+    }
+    
+    /* 标签 */
+    label {
+      display: block;
+      color: #4a5568;
+      font-weight: 500;
+      margin-bottom: 8px;
+    }
+    
+    /* 输入框 */
+    .form-input {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 16px;
+      transition: all 0.2s ease;
+      background: #f7fafc;
+    }
+    
+    .form-input:focus {
+      outline: none;
+      border-color: #667eea;
+      background: white;
+      box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    /* 错误信息 */
+    .error-message {
+      background: #fed7d7;
+      color: #c53030;
+      padding: 12px;
+      border-radius: 6px;
+      margin-bottom: 20px;
+      font-size: 14px;
+      text-align: center;
+      border: 1px solid #feb2b2;
+    }
+    
+    /* 登录按钮 */
+    .login-button {
+      width: 100%;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 14px;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-bottom: 16px;
+    }
+    
+    .login-button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+    }
+    
+    .login-button:active {
+      transform: translateY(0);
+    }
+    
+    /* 页脚 */
+    .footer {
+      text-align: center;
+      color: #718096;
+      font-size: 14px;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <h1>文件管理登录</h1>
+    ${errorMessage ? `<div class="error-message">${errorMessage}</div>` : ''}
+    <form method="POST" action="/login">
+      <div class="form-group">
+        <label for="username">用户名</label>
+        <input type="text" id="username" name="username" class="form-input" required>
+      </div>
+      <div class="form-group">
+        <label for="password">密码</label>
+        <input type="password" id="password" name="password" class="form-input" required>
+      </div>
+      <button type="submit" class="login-button">登录</button>
+    </form>
+    <div class="footer">
+      文件管理服务 &copy; ${new Date().getFullYear()}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 // WebDAV 认证函数
 async function authenticateWebDAV(request, env) {
   try {
-    const authHeader = request.headers.get('Authorization');
-    
-    if (!authHeader || !authHeader.startsWith('Basic ')) {
-      return {
-        authenticated: false,
-        response: new Response('WebDAV 需要认证', {
-          status: 401,
-          headers: {
-            'WWW-Authenticate': 'Basic realm="WebDAV Server"',
-            'DAV': '1, 2, 3',
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Access-Control-Allow-Origin': '*',
-            'MS-Author-Via': 'DAV',
-            'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
-          }
-        })
-      };
-    }
-    
-    // 解码 Basic 认证凭据
-    const encodedCredentials = authHeader.slice('Basic '.length);
-    
-    // 安全解码
-    let decodedCredentials;
+    // 初始化响应头，用于传递CSRF令牌
+    const responseHeaders = new Headers();
+    // 确保URL是完整的
+    let url;
     try {
-      decodedCredentials = atob(encodedCredentials);
+      // 直接使用 request.url 创建 URL 对象
+      url = new URL(request.url);
     } catch (e) {
-      console.error('凭据解码错误:', e);
+      // 如果 URL 解析失败，可能是因为 request.url 只是路径部分（如 "/"）
+      // 从请求头获取必要信息构建完整 URL
+      const host = request.headers.get('Host') || 'localhost';
+      const protocol = request.headers.get('X-Forwarded-Proto') || 'http';
+      
+      // 确保 request.url 是有效的路径
+      let requestPath = request.url;
+      if (!requestPath.startsWith('/')) {
+        requestPath = `/${requestPath}`;
+      }
+      
+      // 构建完整 URL
+      const fullUrl = `${protocol}://${host}${requestPath}`;
+      try {
+        url = new URL(fullUrl);
+      } catch (innerError) {
+        // 如果构建的 URL 仍然无效，使用默认值
+        console.warn('无法构建完整 URL，使用默认值:', fullUrl);
+        url = new URL(`${protocol}://${host}/`);
+      }
+    }
+    const path = url.pathname;
+    
+    // 处理登录请求
+    if (path === '/login' && request.method === 'POST') {
+      try {
+        console.log('开始处理登录请求');
+        // 解析表单数据
+        const formData = await request.formData();
+        console.log('表单数据解析成功');
+        const username = formData.get('username');
+        const password = formData.get('password');
+        
+        console.log('登录表单数据:', { username, password: password ? '[已提供]' : '[未提供]' });
+        
+        // 验证凭据
+        if (!username || !password) {
+          throw new Error('用户名或密码不能为空');
+        }
+        
+        const isValid = await verifyWebDAVCredentials(env, username, password);
+        
+        if (isValid) {
+          console.log('登录成功，生成安全令牌和CSRF令牌');
+          // 使用完整的URL进行重定向，避免解析错误
+          const protocol = request.url.startsWith('https://') ? 'https://' : 'http://';
+          const host = request.headers.get('Host') || 'localhost';
+          const redirectUrl = `${protocol}${host}/`;
+          
+          // 生成随机令牌
+          const token = await generateRandomString(64);
+          // 生成CSRF令牌
+          const csrfToken = await generateRandomString(32);
+          const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24小时后过期
+          
+          // 将令牌和CSRF令牌存储在KV中
+          const tokenKey = `session_${token}`;
+          await env.WEBDAV_STORAGE.put(tokenKey, JSON.stringify({ 
+            username, 
+            createdAt: Date.now(), 
+            expiresAt,
+            csrfToken
+          }), { expirationTtl: 24 * 60 * 60 }); // 设置过期时间
+          
+          // 创建一个新的响应对象而不是使用Response.redirect()，这样可以修改响应头
+          const isHttps = request.url.startsWith('https://');
+          const secureFlag = isHttps ? 'Secure;' : '';
+          const response = new Response(null, {
+            status: 302,
+            headers: {
+              'Location': redirectUrl,
+              'Set-Cookie': `webdav_auth=${token}; Path=/; HttpOnly; ${secureFlag} SameSite=Strict; Max-Age=86400`,
+              'X-CSRF-Token': csrfToken,
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          });
+          return { authenticated: false, response };
+        } else {
+          console.log('登录失败：用户名或密码错误');
+          // 登录失败，显示错误信息
+          const html = renderLoginPage('用户名或密码错误');
+          return {
+            authenticated: false,
+            response: new Response(html, {
+              status: 401,
+              headers: {
+                'Content-Type': 'text/html; charset=utf-8'
+              }
+            })
+          };
+        }
+      } catch (error) {
+        console.error('登录处理错误:', error);
+        console.error('错误堆栈:', error.stack);
+        // 登录失败时不创建会话
+        const html = renderLoginPage('登录过程中出错: ' + error.message);
+        return {
+          authenticated: false,
+          response: new Response(html, {
+            status: 500,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8'
+            }
+          })
+        };
+      }
+    }
+    
+    // 检查认证cookie
+    const cookieHeader = request.headers.get('Cookie');
+    if (cookieHeader) {
+      // 提取令牌
+      const tokenMatch = cookieHeader.match(/webdav_auth=([^;]+)/);
+      if (tokenMatch && tokenMatch[1]) {
+        const token = tokenMatch[1];
+        const tokenKey = `session_${token}`;
+        
+        try {
+          // 从KV中获取令牌信息
+          const sessionData = await env.WEBDAV_STORAGE.get(tokenKey, 'json');
+          if (sessionData && sessionData.expiresAt > Date.now()) {
+            // 令牌有效，实现滑动过期：更新过期时间
+            const newExpiresAt = Date.now() + 86400 * 1000; // 24小时后过期
+            await env.WEBDAV_STORAGE.put(tokenKey, JSON.stringify({
+              ...sessionData,
+              expiresAt: newExpiresAt
+            }), { expirationTtl: 86400 });
+            // 返回认证成功和CSRF令牌
+            return { authenticated: true, csrfToken: sessionData.csrfToken };
+          } else if (sessionData && sessionData.expiresAt <= Date.now()) {
+            // 令牌已过期，清理KV
+            await env.WEBDAV_STORAGE.delete(tokenKey);
+          }
+        } catch (error) {
+          console.error('验证令牌时出错:', error);
+        }
+      }
+    }
+    
+    // 检查Basic Auth（用于WebDAV客户端）
+    const authHeader = request.headers.get('Authorization');
+    if (authHeader && authHeader.startsWith('Basic ')) {
+      // 解码 Basic 认证凭据
+      const encodedCredentials = authHeader.slice('Basic '.length);
+      
+      // 安全解码
+      let decodedCredentials;
+      try {
+        decodedCredentials = atob(encodedCredentials);
+      } catch (e) {
+        console.error('凭据解码错误:', e);
+        return {
+          authenticated: false,
+          response: new Response('无效的认证凭据', {
+            status: 401,
+            headers: {
+              'WWW-Authenticate': 'Basic realm="WebDAV Server"',
+              'DAV': '1, 2',
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          })
+        };
+      }
+      
+      const separatorIndex = decodedCredentials.indexOf(':');
+      if (separatorIndex === -1) {
+        return {
+          authenticated: false,
+          response: new Response('无效的认证凭据格式', {
+            status: 401,
+            headers: {
+              'WWW-Authenticate': 'Basic realm="WebDAV Server"',
+              'DAV': '1, 2',
+              'Content-Type': 'text/plain; charset=utf-8'
+            }
+          })
+        };
+      }
+      
+      const username = decodedCredentials.substring(0, separatorIndex);
+      const password = decodedCredentials.substring(separatorIndex + 1);
+      
+      // 验证凭据
+      const isValid = await verifyWebDAVCredentials(env, username, password);
+      
+      if (isValid) {
+        return { authenticated: true };
+      }
+    }
+    
+    // 对于浏览器访问，返回登录页面
+    const userAgent = request.headers.get('User-Agent');
+    if (userAgent && (userAgent.includes('Mozilla') || userAgent.includes('Chrome') || userAgent.includes('Safari'))) {
+      const html = renderLoginPage();
       return {
         authenticated: false,
-        response: new Response('无效的认证凭据', {
-          status: 401,
+        response: new Response(html, {
+          status: 200,
           headers: {
-            'WWW-Authenticate': 'Basic realm="WebDAV Server"',
-            'DAV': '1, 2',
-            'Content-Type': 'text/plain; charset=utf-8'
+            'Content-Type': 'text/html; charset=utf-8'
           }
         })
       };
     }
     
-    const separatorIndex = decodedCredentials.indexOf(':');
-    if (separatorIndex === -1) {
-      return {
-        authenticated: false,
-        response: new Response('无效的认证凭据格式', {
-          status: 401,
-          headers: {
-            'WWW-Authenticate': 'Basic realm="WebDAV Server"',
-            'DAV': '1, 2',
-            'Content-Type': 'text/plain; charset=utf-8'
-          }
-        })
-      };
-    }
-    
-    const username = decodedCredentials.substring(0, separatorIndex);
-    const password = decodedCredentials.substring(separatorIndex + 1);
-    
-    // 验证凭据
-     const isValid = await verifyWebDAVCredentials(env, username, password);
-    
-    if (!isValid) {
-      return {
-        authenticated: false,
-        response: new Response('用户名或密码错误', {
-          status: 401,
-          headers: {
-            'WWW-Authenticate': 'Basic realm="WebDAV Server"',
-            'DAV': '1, 2',
-            'Content-Type': 'text/plain; charset=utf-8'
-          }
-        })
-      };
-    }
-    
-    return { authenticated: true };
+    // 对于WebDAV客户端，返回Basic Auth挑战
+    return {
+      authenticated: false,
+      response: new Response('WebDAV 需要认证', {
+        status: 401,
+        headers: {
+          'WWW-Authenticate': 'Basic realm="WebDAV Server"',
+          'DAV': '1, 2, 3',
+          'Content-Type': 'text/plain; charset=utf-8',
+          'Access-Control-Allow-Origin': '*',
+          'MS-Author-Via': 'DAV',
+          'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
+        }
+      })
+    };
   } catch (error) {
     console.error('WebDAV 认证错误:', error);
     return {
@@ -382,9 +754,18 @@ async function verifyWebDAVCredentials(env, username, password) {
     const envUsername = env.WEBDAV_USERNAME || 'default';
     const envPassword = env.WEBDAV_PASSWORD || 'default';
     
+    console.log('验证凭据:', {
+      providedUsername: username,
+      providedPassword: password ? '[已提供]' : '[未提供]',
+      envUsername: envUsername,
+      envPassword: envPassword ? '[已配置]' : '[未配置]'
+    });
+    
     // 简单的字符串匹配验证，但添加更健壮的错误处理
     try {
-      return username === envUsername && password === envPassword;
+      const result = username === envUsername && password === envPassword;
+      console.log('验证结果:', result);
+      return result;
     } catch (error) {
       console.error('凭据比较错误:', error);
       return false;
@@ -392,6 +773,135 @@ async function verifyWebDAVCredentials(env, username, password) {
   } catch (error) {
     console.error('验证 WebDAV 凭证时出错:', error);
     return false;
+  }
+}
+
+// 处理 POST 请求（用于客户端操作）
+async function handlePost(request, env, path) {
+  try {
+    // 安全地解析URL
+    let url;
+    try {
+      url = new URL(request.url);
+    } catch (e) {
+      // 如果URL解析失败，尝试从请求头构建完整URL
+      const host = request.headers.get('Host') || 'localhost';
+      const protocol = request.headers.get('X-Forwarded-Proto') || 
+                      (request.url.startsWith('https://') ? 'https' : 'http');
+      
+      // 确保request.url是有效的路径
+      const requestUrl = request.url.startsWith('/') ? request.url : `/${request.url}`;
+      
+      url = new URL(`${protocol}://${host}${requestUrl}`);
+    }
+    const action = url.searchParams.get('action');
+    const normalizedPath = normalizePath(path);
+    
+    switch (action) {
+      case 'createFolder': {
+        // 创建文件夹
+        const formData = await request.formData();
+        const folderName = formData.get('folderName');
+        
+        if (!folderName) {
+          return new Response(JSON.stringify({ success: false, message: '文件夹名称不能为空' }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8'
+            }
+          });
+        }
+        
+        const folderPath = normalizedPath === '/' ? `/${folderName}` : `${normalizedPath}/${folderName}`;
+        const result = await handleMkcol(env, folderPath);
+        
+        return new Response(JSON.stringify({ success: result.status === 201, message: result.status === 201 ? '文件夹创建成功' : '创建文件夹失败' }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8'
+          }
+        });
+      }
+      
+      case 'delete': {
+        // 删除文件或文件夹
+        const formData = await request.formData();
+        const deletePath = formData.get('path');
+        
+        if (!deletePath) {
+          return new Response(JSON.stringify({ success: false, message: '删除路径不能为空' }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8'
+            }
+          });
+        }
+        
+        const result = await handleDelete(env, deletePath);
+        
+        return new Response(JSON.stringify({ success: result.status === 204, message: result.status === 204 ? '删除成功' : '删除失败' }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8'
+          }
+        });
+      }
+      
+      case 'rename': {
+        // 重命名文件或文件夹
+        const formData = await request.formData();
+        const oldPath = formData.get('oldPath');
+        const newName = formData.get('newName');
+        
+        if (!oldPath || !newName) {
+          return new Response(JSON.stringify({ success: false, message: '旧路径和新名称不能为空' }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8'
+            }
+          });
+        }
+        
+        // 提取旧路径的目录部分
+        const oldPathParts = oldPath.split('/');
+        oldPathParts.pop(); // 移除文件名/文件夹名
+        const parentPath = oldPathParts.join('/') || '/';
+        const newPath = parentPath === '/' ? `/${newName}` : `${parentPath}/${newName}`;
+        
+        // 使用MOVE方法来实现重命名
+        const moveRequest = new Request(oldPath, {
+          method: 'MOVE',
+          headers: {
+            'Destination': newPath
+          }
+        });
+        
+        const result = await handleMove(moveRequest, env, oldPath);
+        
+        return new Response(JSON.stringify({ success: result.status === 201 || result.status === 204, message: result.status === 201 || result.status === 204 ? '重命名成功' : '重命名失败' }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8'
+          }
+        });
+      }
+      
+      default:
+        return new Response(JSON.stringify({ success: false, message: '未知操作' }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8'
+          }
+        });
+    }
+  } catch (error) {
+    console.error('处理POST请求失败:', error);
+    return new Response(JSON.stringify({ success: false, message: '处理请求时发生错误' }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8'
+      }
+    });
   }
 }
 
@@ -432,7 +942,21 @@ async function handleWebDAVRequest(request, env) {
   }
   
   // 基本的 WebDAV 方法处理
-  const url = new URL(request.url);
+  // 安全地解析URL
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch (e) {
+    // 如果URL解析失败，尝试从请求头构建完整URL
+    const host = request.headers.get('Host') || 'localhost';
+    const protocol = request.headers.get('X-Forwarded-Proto') || 
+                    (request.url.startsWith('https://') ? 'https' : 'http');
+    
+    // 确保request.url是有效的路径
+    const requestUrl = request.url.startsWith('/') ? request.url : `/${request.url}`;
+    
+    url = new URL(`${protocol}://${host}${requestUrl}`);
+  }
   const path = url.pathname;
   
   switch (request.method) {
@@ -823,35 +1347,381 @@ async function generateDirectoryListing(env, path, resourceInfo) {
   <meta charset="UTF-8">
   <title>目录列表 - ${path}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    h1 { color: #333; }
-    .actions { margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; }
-    .actions button { background-color: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px; }
-    .actions button:hover { background-color: #0056b3; }
-    .actions input[type="text"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; margin-right: 5px; }
-    .actions input[type="file"] { margin-right: 5px; }
-    .modal { display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
-    .modal-content { background-color: white; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 400px; border-radius: 5px; }
-    .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; }
-    .close:hover, .close:focus { color: black; text-decoration: none; cursor: pointer; }
-    table { border-collapse: collapse; width: 100%; margin-top: 20px; }
-    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-    th { background-color: #f2f2f2; }
-    tr:hover { background-color: #f5f5f5; }
-    a { color: #0366d6; text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .dir { color: #0e7490; font-weight: bold; }
-    .file { color: #4b5563; }
-    .size { text-align: right; }
-    .message { padding: 10px; margin: 10px 0; border-radius: 4px; }
-    .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-    .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-    .delete-btn { background-color: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
-.delete-btn:hover { background-color: #c82333; }
-.download-btn { background-color: #007bff; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
-.download-btn:hover { background-color: #0056b3; }
-.rename-btn { background-color: #ffc107; color: black; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
-.rename-btn:hover { background-color: #e0a800; }
+    /* 全局样式 */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { 
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background-color: #f5f7fa;
+      color: #333;
+      line-height: 1.6;
+    }
+    
+    /* 标题样式 */
+    h1 { 
+      color: #2c3e50;
+      margin-bottom: 15px;
+      font-size: 22px;
+      font-weight: 600;
+    }
+    
+    /* 操作区域样式 */
+    .actions { 
+      margin-bottom: 20px;
+      padding: 12px 16px;
+      background-color: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    
+    /* 按钮样式 */
+    .actions button { 
+      background-color: #3498db;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    
+    .actions button:hover { 
+      background-color: #2980b9;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3);
+    }
+    
+    .actions button:active { 
+      transform: translateY(0);
+    }
+    
+    /* 输入框样式 */
+    .actions input[type="text"],
+    .actions input[type="file"] {
+      padding: 10px;
+      border: 1px solid #e1e8ed;
+      border-radius: 6px;
+      font-size: 14px;
+      transition: border-color 0.2s ease;
+    }
+    
+    .actions input[type="text"]:focus {
+      outline: none;
+      border-color: #3498db;
+      box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+    }
+    
+    /* 模态框样式 */
+    .modal { 
+      display: none;
+      position: fixed;
+      z-index: 1000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      background-color: rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(5px);
+    }
+    
+    .modal-content { 
+      background-color: white;
+      margin: 10% auto;
+      padding: 30px;
+      border-radius: 10px;
+      width: 90%;
+      max-width: 450px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+      animation: modalSlideIn 0.3s ease;
+    }
+    
+    @keyframes modalSlideIn {
+      from { 
+        opacity: 0;
+        transform: translateY(-50px);
+      }
+      to { 
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    
+    /* 模态框关闭按钮 */
+    .close { 
+      color: #95a5a6;
+      float: right;
+      font-size: 28px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: color 0.2s ease;
+      line-height: 1;
+    }
+    
+    .close:hover, .close:focus { 
+      color: #2c3e50;
+    }
+    
+    /* 模态框标题 */
+    .modal-content h2 {
+      color: #2c3e50;
+      margin-bottom: 20px;
+      font-size: 22px;
+      font-weight: 600;
+    }
+    
+    /* 模态框输入框 */
+    .modal-content input[type="text"] {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #e1e8ed;
+      border-radius: 6px;
+      font-size: 14px;
+      margin-bottom: 20px;
+      transition: border-color 0.2s ease;
+    }
+    
+    .modal-content input[type="text"]:focus {
+      outline: none;
+      border-color: #3498db;
+      box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+    }
+    
+    /* 模态框按钮容器 */
+    .modal-content button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      margin-right: 10px;
+      transition: all 0.2s ease;
+    }
+    
+    /* 确认按钮 */
+    #confirmCreateFolder,
+    #confirmUploadFile,
+    #confirmDelete,
+    #confirmRename {
+      background-color: #27ae60;
+      color: white;
+    }
+    
+    #confirmCreateFolder:hover,
+    #confirmUploadFile:hover,
+    #confirmDelete:hover,
+    #confirmRename:hover {
+      background-color: #229954;
+      transform: translateY(-1px);
+    }
+    
+    /* 取消按钮 */
+    #cancelCreateFolder,
+    #cancelUploadFile,
+    #cancelDelete,
+    #cancelRename {
+      background-color: #95a5a6;
+      color: white;
+    }
+    
+    #cancelCreateFolder:hover,
+    #cancelUploadFile:hover,
+    #cancelDelete:hover,
+    #cancelRename:hover {
+      background-color: #7f8c8d;
+    }
+    
+    /* 表格样式 */
+    table { 
+      border-collapse: collapse;
+      width: 100%;
+      background-color: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      overflow: hidden;
+    }
+    
+    th, td { 
+      border-bottom: 1px solid #f0f2f5;
+      padding: 14px 16px;
+      text-align: left;
+      font-size: 14px;
+    }
+    
+    th { 
+      background-color: #f8f9fa;
+      color: #666;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+    }
+    
+    tr { 
+      transition: background-color 0.2s ease;
+    }
+    
+    tr:hover { 
+      background-color: #f8fafc;
+    }
+    
+    /* 链接样式 */
+    a { 
+      color: #3498db;
+      text-decoration: none;
+      transition: color 0.2s ease;
+    }
+    
+    a:hover { 
+      color: #2980b9;
+    }
+    
+    /* 文件和目录样式 */
+    .dir { 
+      color: #f39c12;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    .file { 
+      color: #2c3e50;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    
+    /* 大小列样式 */
+    .size { 
+      text-align: right;
+      color: #666;
+    }
+    
+    /* 消息提示样式 */
+    .message { 
+      padding: 14px 20px;
+      margin: 15px 0;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+      animation: messageSlideIn 0.3s ease;
+    }
+    
+    @keyframes messageSlideIn {
+      from { 
+        opacity: 0;
+        transform: translateX(-20px);
+      }
+      to { 
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+    
+    .success { 
+      background-color: #d4edda;
+      color: #155724;
+      border-left: 4px solid #27ae60;
+    }
+    
+    .error { 
+      background-color: #f8d7da;
+      color: #721c24;
+      border-left: 4px solid #e74c3c;
+    }
+    
+    /* 操作按钮样式 */
+    .rename-btn, .download-btn, .delete-btn {
+      background-color: #95a5a6;
+      color: white;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      text-decoration: none;
+      display: inline-block;
+      margin-right: 6px;
+      transition: all 0.2s ease;
+    }
+    
+    .rename-btn:hover, .download-btn:hover, .delete-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    }
+    
+    .rename-btn { 
+      background-color: #f39c12;
+    }
+    
+    .rename-btn:hover { 
+      background-color: #e67e22;
+    }
+    
+    .download-btn { 
+      background-color: #27ae60;
+    }
+    
+    .download-btn:hover { 
+      background-color: #229954;
+    }
+    
+    .delete-btn { 
+      background-color: #e74c3c;
+    }
+    
+    .delete-btn:hover { 
+      background-color: #c0392b;
+    }
+    
+    /* 响应式设计 */
+    @media (max-width: 768px) {
+      body {
+        padding: 10px;
+      }
+      
+      h1 {
+        font-size: 24px;
+      }
+      
+      .actions {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      
+      .actions button {
+        width: 100%;
+        justify-content: center;
+      }
+      
+      table {
+        font-size: 13px;
+      }
+      
+      th, td {
+        padding: 10px;
+      }
+      
+      .modal-content {
+        margin: 20% auto;
+        width: 95%;
+        padding: 20px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -861,6 +1731,7 @@ async function generateDirectoryListing(env, path, resourceInfo) {
   <div class="actions">
     <button id="createFolderBtn">创建文件夹</button>
     <button id="uploadFileBtn">上传文件</button>
+    <button id="logoutBtn" style="margin-left: auto; background-color: #e74c3c;">登出</button>
   </div>
   
   <!-- 创建文件夹模态框 -->
@@ -1015,6 +1886,29 @@ async function generateDirectoryListing(env, path, resourceInfo) {
         deleteModal.style.display = 'none';
         renameModal.style.display = 'none';
         newNameInput.value = '';
+      });
+    }
+    
+    // 登出功能
+    const logoutBtn = document.getElementById('logoutBtn');
+    if (logoutBtn) {
+      logoutBtn.addEventListener('click', async () => {
+        try {
+          // 发送登出请求
+          const response = await fetch('/logout', {
+            method: 'POST'
+          });
+          // 检查响应状态
+          if (response.ok) {
+            // 刷新页面，将被重定向到登录页
+            window.location.reload();
+          } else {
+            throw new Error('登出请求失败');
+          }
+        } catch (error) {
+          console.error('登出失败:', error);
+          showMessage('登出失败', 'error');
+        }
       });
     }
     
@@ -1376,7 +2270,17 @@ async function handleCopy(request, env, path) {
       });
     }
     
-    const destinationUrl = new URL(destinationHeader);
+    let destinationUrl;
+    try {
+      // 尝试直接解析为完整URL
+      destinationUrl = new URL(destinationHeader);
+    } catch (e) {
+      // 如果是相对路径，使用当前请求的协议和主机构建完整URL
+      const currentUrl = new URL(request.url);
+      // 确保路径以/开头
+      const normalizedDestHeader = destinationHeader.startsWith('/') ? destinationHeader : `/${destinationHeader}`;
+      destinationUrl = new URL(normalizedDestHeader, `${currentUrl.protocol}//${currentUrl.host}`);
+    }
     let destinationPath = destinationUrl.pathname;
     
     // 不再需要移除/dav前缀
@@ -1474,7 +2378,17 @@ async function handleMove(request, env, path) {
       });
     }
     
-    const destinationUrl = new URL(destinationHeader);
+    let destinationUrl;
+    try {
+      // 尝试直接解析为完整URL
+      destinationUrl = new URL(destinationHeader);
+    } catch (e) {
+      // 如果是相对路径，使用当前请求的协议和主机构建完整URL
+      const currentUrl = new URL(request.url);
+      // 确保路径以/开头
+      const normalizedDestHeader = destinationHeader.startsWith('/') ? destinationHeader : `/${destinationHeader}`;
+      destinationUrl = new URL(normalizedDestHeader, `${currentUrl.protocol}//${currentUrl.host}`);
+    }
     let destinationPath = destinationUrl.pathname;
     
     // 不再需要移除/dav前缀
@@ -1864,7 +2778,8 @@ async function listDirectoryChildren(env, path) {
     // 收集所有需要处理的目录信息
     const directoriesToProcess = [];
     for (const key of listResult.keys) {
-      if (key.name.endsWith('_meta') || !key.name.endsWith('_dir')) continue;
+      // 过滤掉session数据和非目录项
+      if (key.name.endsWith('_meta') || !key.name.endsWith('_dir') || key.name.startsWith('session_')) continue;
       
       let dirName;
       if (normalizedPath === '/') {
@@ -1906,7 +2821,8 @@ async function listDirectoryChildren(env, path) {
     // 收集所有需要处理的文件信息
     const filesToProcess = [];
     for (const key of listResult.keys) {
-      if (key.name.endsWith('_meta') || key.name.endsWith('_dir') || processedChildren.has(key.name)) continue;
+      // 过滤掉session数据、元数据、目录和已处理的项
+      if (key.name.endsWith('_meta') || key.name.endsWith('_dir') || processedChildren.has(key.name) || key.name.startsWith('session_')) continue;
       
       let isFile = false;
       let fileName = '';

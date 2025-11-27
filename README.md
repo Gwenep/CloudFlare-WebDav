@@ -1,6 +1,6 @@
-# Cloudflare WebDAV Server
+# Cloudflare WebDAV文件服务
 
-基于 Cloudflare Workers 和 KV 存储的 WebDAV 服务器实现，提供轻量级的 WebDAV 服务，支持跨平台访问文件，无需绑卡开通R2存储。
+基于 Cloudflare Workers 和 KV 存储的 WebDAV 文件服务器实现，支持跨平台访问文件，无需绑卡开通R2存储。
 
 ## 功能特性
 

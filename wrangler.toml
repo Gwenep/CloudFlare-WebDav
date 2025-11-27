@@ -18,11 +18,7 @@ id = "your-dev-kv-namespace-id"
 [vars]
 # 可以在这里定义全局变量
 MAX_UPLOAD_SIZE = 10000000  # 10MB
+# WebDAV 登录凭据
+WEBDAV_USERNAME = "admin"  # 默认用户名
+WEBDAV_PASSWORD = "admin"  # 默认密码
 
-# 可选：自定义路由
-# routes = [
-#   {
-#     pattern = "example.com/dav*",
-#     zone_name = "example.com"
-#   }
-# ]
