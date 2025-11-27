@@ -812,19 +812,28 @@ async function generateDirectoryListing(env, path, resourceInfo) {
   try {
     const children = await listDirectoryChildren(env, path);
     
-   // 过滤掉任何空名称文件和目录标记
+   // 过滤掉任何空名称文件、目录标记和根目录标记
     const filteredChildren = children.filter(child => 
-      child.name.trim() !== '' && child.name !== '_dir'
+      child.name.trim() !== '' && child.name !== '_dir' && child.name !== '/'
     );
     
     let html = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>目录列表 - ${path === '/' ? '根目录' : path}</title>
+  <title>目录列表 - ${path}</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     h1 { color: #333; }
+    .actions { margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; }
+    .actions button { background-color: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+    .actions button:hover { background-color: #0056b3; }
+    .actions input[type="text"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; margin-right: 5px; }
+    .actions input[type="file"] { margin-right: 5px; }
+    .modal { display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); }
+    .modal-content { background-color: white; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 400px; border-radius: 5px; }
+    .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; }
+    .close:hover, .close:focus { color: black; text-decoration: none; cursor: pointer; }
     table { border-collapse: collapse; width: 100%; margin-top: 20px; }
     th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
     th { background-color: #f2f2f2; }
@@ -834,16 +843,80 @@ async function generateDirectoryListing(env, path, resourceInfo) {
     .dir { color: #0e7490; font-weight: bold; }
     .file { color: #4b5563; }
     .size { text-align: right; }
+    .message { padding: 10px; margin: 10px 0; border-radius: 4px; }
+    .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .delete-btn { background-color: #dc3545; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
+.delete-btn:hover { background-color: #c82333; }
+.download-btn { background-color: #007bff; color: white; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
+.download-btn:hover { background-color: #0056b3; }
+.rename-btn { background-color: #ffc107; color: black; border: none; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; text-decoration: none; display: inline-block; margin-right: 4px; }
+.rename-btn:hover { background-color: #e0a800; }
   </style>
 </head>
 <body>
-  <h1>目录: ${path === '/' ? '根目录' : path}</h1>
+  <h1>目录: ${path}</h1>
+  
+  <!-- 操作按钮区域 -->
+  <div class="actions">
+    <button id="createFolderBtn">创建文件夹</button>
+    <button id="uploadFileBtn">上传文件</button>
+  </div>
+  
+  <!-- 创建文件夹模态框 -->
+  <div id="createFolderModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>创建新文件夹</h2>
+      <input type="text" id="folderName" placeholder="输入文件夹名称">
+      <button id="confirmCreateFolder">创建</button>
+      <button id="cancelCreateFolder">取消</button>
+    </div>
+  </div>
+  
+  <!-- 上传文件模态框 -->
+  <div id="uploadFileModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>上传文件</h2>
+      <input type="file" id="fileUpload">
+      <button id="confirmUploadFile">上传</button>
+      <button id="cancelUploadFile">取消</button>
+    </div>
+  </div>
+  
+  <!-- 删除确认模态框 -->
+  <div id="deleteModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>确认删除</h2>
+      <p id="deleteMessage">确定要删除该资源吗？</p>
+      <button id="confirmDelete">删除</button>
+      <button id="cancelDelete">取消</button>
+    </div>
+  </div>
+  
+  <!-- 重命名模态框 -->
+  <div id="renameModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>重命名</h2>
+      <input type="text" id="newName" placeholder="输入新名称">
+      <button id="confirmRename">重命名</button>
+      <button id="cancelRename">取消</button>
+    </div>
+  </div>
+  
+  <!-- 消息显示区域 -->
+  <div id="message"></div>
+  
   <table>
     <tr>
       <th>名称</th>
       <th>类型</th>
       <th class="size">大小</th>
       <th>修改时间</th>
+      <th>操作</th>
     </tr>`;
     
     // 添加父目录链接
@@ -856,6 +929,7 @@ async function generateDirectoryListing(env, path, resourceInfo) {
         <td><a href="${parentLink}" class="dir">..</a></td>
         <td>目录</td>
         <td class="size">-</td>
+        <td>-</td>
         <td>-</td>
       </tr>`;
     }
@@ -881,11 +955,263 @@ async function generateDirectoryListing(env, path, resourceInfo) {
         <td>${child.type === 'directory' ? '目录' : '文件'}</td>
         <td class="size">${child.type === 'directory' ? '-' : (child.size ? formatFileSize(child.size) : '未知')}</td>
         <td>${new Date(child.modifiedAt).toLocaleString()}</td>
+        <td><button class="rename-btn" data-path="${fullLink}" data-name="${child.name}" data-type="${child.type}">重命名</button> ${child.type === 'directory' ? '' : '<a href="' + fullLink + '" class="download-btn" download>下载</a>'} <button class="delete-btn" data-path="${fullLink}" data-name="${child.name}" data-type="${child.type}">删除</button></td>
       </tr>`;
     }
     
     html += `
   </table>
+  
+  <script>
+    // 消息显示函数
+    function showMessage(text, type) {
+      const messageDiv = document.getElementById('message');
+      messageDiv.className = 'message ' + type;
+      messageDiv.textContent = text;
+      messageDiv.style.display = 'block';
+      setTimeout(() => {
+        messageDiv.style.display = 'none';
+      }, 3000);
+    }
+    
+    // 模态框处理
+    const createFolderModal = document.getElementById('createFolderModal');
+    const uploadFileModal = document.getElementById('uploadFileModal');
+    const deleteModal = document.getElementById('deleteModal');
+    const renameModal = document.getElementById('renameModal');
+    const createFolderBtn = document.getElementById('createFolderBtn');
+    const uploadFileBtn = document.getElementById('uploadFileBtn');
+    const closeButtons = document.getElementsByClassName('close');
+    const cancelCreateFolder = document.getElementById('cancelCreateFolder');
+    const cancelUploadFile = document.getElementById('cancelUploadFile');
+    const cancelDelete = document.getElementById('cancelDelete');
+    const cancelRename = document.getElementById('cancelRename');
+    const deleteMessage = document.getElementById('deleteMessage');
+    const confirmDelete = document.getElementById('confirmDelete');
+    const confirmRename = document.getElementById('confirmRename');
+    const newNameInput = document.getElementById('newName');
+    let currentDeletePath = '';
+    let currentDeleteName = '';
+    let currentDeleteType = '';
+    let currentRenamePath = '';
+    let currentRenameName = '';
+    let currentRenameType = '';
+    
+    // 打开创建文件夹模态框
+    createFolderBtn.addEventListener('click', () => {
+      createFolderModal.style.display = 'block';
+    });
+    
+    // 打开上传文件模态框
+    uploadFileBtn.addEventListener('click', () => {
+      uploadFileModal.style.display = 'block';
+    });
+    
+    // 关闭模态框
+    for (let i = 0; i < closeButtons.length; i++) {
+      closeButtons[i].addEventListener('click', () => {
+        createFolderModal.style.display = 'none';
+        uploadFileModal.style.display = 'none';
+        deleteModal.style.display = 'none';
+        renameModal.style.display = 'none';
+        newNameInput.value = '';
+      });
+    }
+    
+
+    
+    // 取消按钮
+    cancelCreateFolder.addEventListener('click', () => {
+      createFolderModal.style.display = 'none';
+    });
+    
+    cancelUploadFile.addEventListener('click', () => {
+      uploadFileModal.style.display = 'none';
+    });
+    
+    cancelDelete.addEventListener('click', () => {
+      deleteModal.style.display = 'none';
+    });
+    
+    cancelRename.addEventListener('click', () => {
+      renameModal.style.display = 'none';
+      newNameInput.value = '';
+    });
+    
+    // 点击模态框外部关闭
+    window.addEventListener('click', (event) => {
+      if (event.target === createFolderModal) {
+        createFolderModal.style.display = 'none';
+      }
+      if (event.target === uploadFileModal) {
+        uploadFileModal.style.display = 'none';
+      }
+      if (event.target === deleteModal) {
+        deleteModal.style.display = 'none';
+      }
+      if (event.target === renameModal) {
+        renameModal.style.display = 'none';
+        newNameInput.value = '';
+      }
+    });
+    
+    // 创建文件夹
+    document.getElementById('confirmCreateFolder').addEventListener('click', async () => {
+      const folderName = document.getElementById('folderName').value.trim();
+      if (!folderName) {
+        showMessage('请输入文件夹名称', 'error');
+        return;
+      }
+      
+      try {
+        // 修复路径拼接问题，避免双斜杠
+        const folderPath = window.location.pathname.endsWith('/') 
+          ? window.location.pathname + folderName 
+          : window.location.pathname + '/' + folderName;
+        
+        const response = await fetch(folderPath, {
+          method: 'MKCOL'
+        });
+        
+        if (response.ok) {
+          showMessage('文件夹创建成功', 'success');
+          createFolderModal.style.display = 'none';
+          // 刷新页面
+          window.location.reload();
+        } else {
+          showMessage('文件夹创建失败: ' + response.statusText, 'error');
+        }
+      } catch (error) {
+        showMessage('创建文件夹时发生错误: ' + error.message, 'error');
+      }
+    });
+    
+    // 上传文件
+    document.getElementById('confirmUploadFile').addEventListener('click', async () => {
+      const fileInput = document.getElementById('fileUpload');
+      const file = fileInput.files[0];
+      
+      if (!file) {
+        showMessage('请选择要上传的文件', 'error');
+        return;
+      }
+      
+      try {
+        // 修复路径拼接问题，避免双斜杠
+        const filePath = window.location.pathname.endsWith('/') 
+          ? window.location.pathname + file.name 
+          : window.location.pathname + '/' + file.name;
+        
+        const response = await fetch(filePath, {
+          method: 'PUT',
+          body: file
+        });
+        
+        if (response.ok) {
+          showMessage('文件上传成功', 'success');
+          uploadFileModal.style.display = 'none';
+          // 刷新页面
+          window.location.reload();
+        } else {
+          showMessage('文件上传失败: ' + response.statusText, 'error');
+        }
+      } catch (error) {
+        showMessage('上传文件时发生错误: ' + error.message, 'error');
+      }
+    });
+    
+    // 重命名功能
+    
+    // 点击重命名按钮
+    document.addEventListener('click', (event) => {
+      if (event.target.classList.contains('rename-btn')) {
+        currentRenamePath = event.target.getAttribute('data-path');
+        currentRenameName = event.target.getAttribute('data-name');
+        currentRenameType = event.target.getAttribute('data-type');
+        
+        newNameInput.value = currentRenameName;
+        renameModal.style.display = 'block';
+      }
+    });
+    
+    // 确认重命名
+    confirmRename.addEventListener('click', async () => {
+      const newName = newNameInput.value.trim();
+      if (!newName) {
+        showMessage('请输入新名称', 'error');
+        return;
+      }
+      
+      if (newName === currentRenameName) {
+        showMessage('新名称与原名称相同', 'error');
+        return;
+      }
+      
+      try {
+        // 获取父目录路径
+        const parentPath = currentRenamePath.substring(0, currentRenamePath.lastIndexOf('/')) || '/';
+        const newPath = parentPath + '/' + newName;
+        
+        // 发送重命名请求
+        const response = await fetch(currentRenamePath, {
+          method: 'MOVE',
+          headers: {
+            'Destination': window.location.origin + newPath
+          }
+        });
+        
+        if (response.ok) {
+          showMessage((currentRenameType === 'directory' ? '目录' : '文件') + '重命名成功', 'success');
+          // 刷新页面
+          setTimeout(() => {
+            window.location.reload();
+          }, 1000);
+        } else {
+          const errorText = await response.text();
+          showMessage((currentRenameType === 'directory' ? '目录' : '文件') + '重命名失败: ' + response.status + ' ' + response.statusText, 'error');
+        }
+      } catch (error) {
+        showMessage('重命名操作失败: ' + error.message, 'error');
+      } finally {
+        renameModal.style.display = 'none';
+        newNameInput.value = '';
+      }
+    });
+    
+    // 删除功能
+    
+    // 点击删除按钮
+    document.addEventListener('click', (event) => {
+      if (event.target.classList.contains('delete-btn')) {
+        currentDeletePath = event.target.getAttribute('data-path');
+        currentDeleteName = event.target.getAttribute('data-name');
+        currentDeleteType = event.target.getAttribute('data-type');
+        
+        deleteMessage.textContent = '确定要删除' + (currentDeleteType === 'directory' ? '目录' : '文件') + ' "' + currentDeleteName + '"吗？' + (currentDeleteType === 'directory' ? '（目录可能不为空）' : '');
+        deleteModal.style.display = 'block';
+      }
+    });
+    
+    // 确认删除
+    confirmDelete.addEventListener('click', async () => {
+      try {
+        const response = await fetch(currentDeletePath, {
+          method: 'DELETE'
+        });
+        
+        if (response.ok) {
+          showMessage((currentDeleteType === 'directory' ? '目录' : '文件') + '删除成功', 'success');
+          deleteModal.style.display = 'none';
+          // 刷新页面
+          window.location.reload();
+        } else {
+          showMessage((currentDeleteType === 'directory' ? '目录' : '文件') + '删除失败: ' + response.status + ' ' + response.statusText, 'error');
+        }
+      } catch (error) {
+        showMessage('删除时发生错误: ' + error.message, 'error');
+      }
+    });
+  </script>
 </body>
 </html>`;
     
