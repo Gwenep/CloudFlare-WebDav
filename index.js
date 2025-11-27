@@ -147,18 +147,30 @@ export default {
               return await handleMkcol(env, davPath);
     // 添加更多WebDAV方法支持
     case 'COPY':
+      return await handleCopy(request, env, davPath);
     case 'MOVE':
+      return await handleMove(request, env, davPath);
     case 'PROPPATCH':
-      // 这些方法对于Windows和某些客户端是必需的
-      // 返回200但不阻止请求，允许客户端继续工作
-      return new Response('方法不支持但允许继续', {
+      // PROPPATCH方法用于修改资源属性，基本实现以支持更多客户端
+      return new Response(null, { 
+        status: 204,
+        headers: {
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV',
+          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH',
+          'X-Content-Type-Options': 'nosniff'
+        }
+      });
+    case 'LOCK':
+    case 'UNLOCK':
+      // 基本的LOCK/UNLOCK支持，返回200以支持更多客户端
+      return new Response(null, { 
         status: 200,
         headers: {
           'DAV': '1, 2, 3',
           'MS-Author-Via': 'DAV',
-          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
-          'X-Content-Type-Options': 'nosniff',
-          'Content-Length': '0'
+          'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
+          'X-Content-Type-Options': 'nosniff'
         }
       });
     default:
@@ -469,14 +481,14 @@ function handleOptions() {
   return new Response(null, {
     headers: {
       'DAV': '1, 2, 3',
-      'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+      'Allow': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
       'Accept-Ranges': 'bytes',
       'Content-Length': '0',
       'MS-Author-Via': 'DAV',
-      'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+      'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
-      'Access-Control-Allow-Headers': 'Authorization, Content-Type, Depth, Overwrite, Destination, X-Requested-With'
+      'Access-Control-Allow-Methods': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type, Depth, Overwrite, Destination, X-Requested-With, Lock-Token'
     }
   });
 }
@@ -972,14 +984,16 @@ async function handlePut(request, env, path) {
     // 更新父目录修改时间
     await updateDirectoryTimestamp(env, parentPath);
     
-    // 为安卓客户端返回204状态码，有些客户端不喜欢201
+    // 为大多数客户端返回201状态码，这是文件创建的标准响应
+    // 同时添加Content-Location头部，提高与各种文件管理器的兼容性
     return new Response(null, { 
-      status: 204,
+      status: 201,
       headers: {
         'Access-Control-Allow-Origin': '*',
         'DAV': '1, 2, 3',
         'MS-Author-Via': 'DAV',
-        'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL'
+        'Public': 'OPTIONS, GET, HEAD, DELETE, PUT, PROPFIND, MKCOL',
+        'Content-Location': `/dav${normalizedPath}`
       }
     });
   } catch (error) {
@@ -1041,6 +1055,218 @@ async function handleDelete(env, path) {
   }
 }
 
+// 处理 COPY 请求
+async function handleCopy(request, env, path) {
+  try {
+    const normalizedPath = normalizePath(path);
+    
+    // 获取目标路径
+    const destinationHeader = request.headers.get('Destination');
+    if (!destinationHeader) {
+      return new Response('缺少目标路径', { 
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
+    }
+    
+    const destinationUrl = new URL(destinationHeader);
+    let destinationPath = destinationUrl.pathname;
+    
+    // 移除/dav前缀
+    if (destinationPath.startsWith('/dav')) {
+      destinationPath = destinationPath.slice(4);
+    }
+    
+    const normalizedDestPath = normalizePath(destinationPath);
+    
+    // 检查源资源是否存在
+    const sourceInfo = await getResourceInfo(env, normalizedPath);
+    if (!sourceInfo) {
+      return new Response('源资源不存在', { 
+        status: 404,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
+    }
+    
+    // 检查目标资源是否存在
+    const destInfo = await getResourceInfo(env, normalizedDestPath);
+    if (destInfo) {
+      // 如果目标存在，根据Overwrite头部决定是否覆盖
+      const overwriteHeader = request.headers.get('Overwrite') || 'T';
+      if (overwriteHeader.toLowerCase() !== 't') {
+        return new Response('目标已存在且不允许覆盖', { 
+          status: 412,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'DAV': '1, 2, 3',
+            'MS-Author-Via': 'DAV'
+          }
+        });
+      }
+    }
+    
+    if (sourceInfo.type === 'file') {
+      // 复制文件
+      const content = await env.WEBDAV_STORAGE.get(normalizedPath, 'arrayBuffer');
+      if (content) {
+        await env.WEBDAV_STORAGE.put(normalizedDestPath, content);
+        
+        // 复制元数据
+        const metaData = await env.WEBDAV_STORAGE.get(`${normalizedPath}_meta`, 'json');
+        if (metaData) {
+          await env.WEBDAV_STORAGE.put(`${normalizedDestPath}_meta`, JSON.stringify(metaData));
+        }
+      }
+    } else {
+      // 复制目录（简化实现，只复制目录标记）
+      await env.WEBDAV_STORAGE.put(`${normalizedDestPath}_dir`, JSON.stringify(sourceInfo));
+    }
+    
+    // 更新父目录时间戳
+    const destParentPath = getParentPath(normalizedDestPath);
+    await updateDirectoryTimestamp(env, destParentPath);
+    
+    return new Response(null, { 
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV'
+      }
+    });
+  } catch (error) {
+    console.error('COPY 处理错误:', error);
+    return new Response('复制资源时出错', { 
+      status: 500,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV'
+      }
+    });
+  }
+}
+
+// 处理 MOVE 请求
+async function handleMove(request, env, path) {
+  try {
+    const normalizedPath = normalizePath(path);
+    
+    // 获取目标路径
+    const destinationHeader = request.headers.get('Destination');
+    if (!destinationHeader) {
+      return new Response('缺少目标路径', { 
+        status: 400,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
+    }
+    
+    const destinationUrl = new URL(destinationHeader);
+    let destinationPath = destinationUrl.pathname;
+    
+    // 移除/dav前缀
+    if (destinationPath.startsWith('/dav')) {
+      destinationPath = destinationPath.slice(4);
+    }
+    
+    const normalizedDestPath = normalizePath(destinationPath);
+    
+    // 检查源资源是否存在
+    const sourceInfo = await getResourceInfo(env, normalizedPath);
+    if (!sourceInfo) {
+      return new Response('源资源不存在', { 
+        status: 404,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'DAV': '1, 2, 3',
+          'MS-Author-Via': 'DAV'
+        }
+      });
+    }
+    
+    // 检查目标资源是否存在
+    const destInfo = await getResourceInfo(env, normalizedDestPath);
+    if (destInfo) {
+      // 如果目标存在，根据Overwrite头部决定是否覆盖
+      const overwriteHeader = request.headers.get('Overwrite') || 'T';
+      if (overwriteHeader.toLowerCase() !== 't') {
+        return new Response('目标已存在且不允许覆盖', { 
+          status: 412,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'DAV': '1, 2, 3',
+            'MS-Author-Via': 'DAV'
+          }
+        });
+      }
+    }
+    
+    if (sourceInfo.type === 'file') {
+      // 移动文件
+      const content = await env.WEBDAV_STORAGE.get(normalizedPath, 'arrayBuffer');
+      if (content) {
+        // 先复制到目标
+        await env.WEBDAV_STORAGE.put(normalizedDestPath, content);
+        
+        // 复制元数据
+        const metaData = await env.WEBDAV_STORAGE.get(`${normalizedPath}_meta`, 'json');
+        if (metaData) {
+          await env.WEBDAV_STORAGE.put(`${normalizedDestPath}_meta`, JSON.stringify(metaData));
+        }
+        
+        // 删除源文件
+        await env.WEBDAV_STORAGE.delete(normalizedPath);
+        await env.WEBDAV_STORAGE.delete(`${normalizedPath}_meta`);
+      }
+    } else {
+      // 移动目录
+      // 复制目录标记
+      await env.WEBDAV_STORAGE.put(`${normalizedDestPath}_dir`, JSON.stringify(sourceInfo));
+      
+      // 删除源目录标记
+      await env.WEBDAV_STORAGE.delete(`${normalizedPath}_dir`);
+    }
+    
+    // 更新父目录时间戳
+    const sourceParentPath = getParentPath(normalizedPath);
+    await updateDirectoryTimestamp(env, sourceParentPath);
+    
+    const destParentPath = getParentPath(normalizedDestPath);
+    await updateDirectoryTimestamp(env, destParentPath);
+    
+    return new Response(null, { 
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV'
+      }
+    });
+  } catch (error) {
+    console.error('MOVE 处理错误:', error);
+    return new Response('移动资源时出错', { 
+      status: 500,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'DAV': '1, 2, 3',
+        'MS-Author-Via': 'DAV'
+      }
+    });
+  }
+}
+
 // 处理 MKCOL 请求（创建目录）
 async function handleMkcol(env, path) {
   try {
@@ -1051,15 +1277,28 @@ async function handleMkcol(env, path) {
     
     // 检查路径是否已存在
     const existingInfo = await getResourceInfo(env, normalizedPath);
-    if (existingInfo && existingInfo.type === 'directory') {
-      return new Response('目录已存在', { 
-        status: 405,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'DAV': '1, 2, 3',
-          'MS-Author-Via': 'DAV'
-        }
-      });
+    if (existingInfo) {
+      if (existingInfo.type === 'directory') {
+        // 目录已存在，返回201状态码（标准WebDAV行为）
+        return new Response(null, { 
+          status: 201,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'DAV': '1, 2, 3',
+            'MS-Author-Via': 'DAV'
+          }
+        });
+      } else {
+        // 路径已存在但不是目录，返回409 Conflict
+        return new Response('路径已存在但不是目录', { 
+          status: 409,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'DAV': '1, 2, 3',
+            'MS-Author-Via': 'DAV'
+          }
+        });
+      }
     }
     
     // 确保父目录存在
