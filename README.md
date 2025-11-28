@@ -101,7 +101,7 @@ A: 检查文件大小是否超过限制，确保 KV 存储空间充足
 
 ## 许可证
 
-MIT License
+GNU General Public License v3.0
 
 ## 贡献
 
